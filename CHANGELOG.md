@@ -58,8 +58,9 @@ Each release is also published at
   desktop integrations have new ids: `io.github.maximusdevs.ai-monitor`
   (KDE), `ai-monitor@maximusdevs.github.io` (GNOME),
   `maximusdevs.ai-monitor` (Omarchy); reinstall them from this repository.
-- The README is now a one-page overview; the full reference moved to
-  `docs/guide.md`.
+- The README is a shorter overview (features, display modes, install,
+  sign-in, usage, configuration, credits to ai-usagebar and claudebar); the
+  full reference moved to `docs/guide.md`.
 
 - New README front section: display modes with screenshots (example
   accounts only), the `[display]` reference, a per-frontend table, and the
