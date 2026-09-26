@@ -1,0 +1,24 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Id": "io.github.maximusdevs.ai-monitor",
+        "Name": "AI Monitor",
+        "Description": "AI plan usage in the Plasma panel",
+        "Icon": "utilities-system-monitor",
+        "Category": "System Information",
+        "License": "MIT",
+        "Version": "0.2.0",
+        "Authors": [
+            {
+                "Name": "Luan Victor"
+            }
+        ],
+        "Website": "https://github.com/maximusdevs/ai-monitor",
+        "BugReportUrl": "https://github.com/maximusdevs/ai-monitor/issues",
+        "EnabledByDefault": true,
+        "FormFactors": [
+            "desktop"
+        ]
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
