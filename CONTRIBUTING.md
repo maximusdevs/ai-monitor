@@ -6,8 +6,8 @@ on the same handful of mechanical things.
 
 ## Before you open a PR
 
-Run the gate. It is the same one CI runs, and it catches almost everything a
-review would otherwise send back:
+Run the gate. There is no CI on pushes or pull requests, so this is the
+check, and it catches almost everything a review would otherwise send back:
 
 ```
 make test                                   # cargo test + the GNOME, KDE and Omarchy contract suites
@@ -74,7 +74,7 @@ gets pinned to, and a paraphrase is not enough to build against.
 
 ## Platform reality
 
-CI builds Linux, macOS and Windows, but the maintainer works on Linux. macOS
-code paths — the Keychain, Claude Desktop, `safe_storage` — get compiled but
+The maintainer works on Linux; only a release build compiles macOS and
+Windows. macOS code paths — the Keychain, Claude Desktop, `safe_storage` — get compiled but
 not exercised. If you are on a Mac and can test a change there, say so in the
 PR; that is worth more than it sounds.

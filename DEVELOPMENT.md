@@ -91,7 +91,7 @@ Default config locations:
 
 ## Tests
 
-The gate contributors run is the same one CI runs:
+Run the gate before every commit; there is no CI on pushes:
 
 ```bash
 make test                                          # cargo test + desktop JS suites
@@ -130,7 +130,7 @@ cargo fmt --all
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-CI denies warnings (`-D warnings`) and checks formatting. rustfmt is the
+The gate denies warnings (`-D warnings`) and checks formatting. rustfmt is the
 style; do not hand-format around it.
 
 ## Configuration while developing
@@ -201,7 +201,7 @@ Details, PATH, and tray install: [docs/windows-build.md](docs/windows-build.md).
 | `tests/` | Integration, live smoke, fixtures |
 | `frontends/gnome/`, `frontends/kde/`, `frontends/omarchy/`, `frontends/macos/`, `frontends/windows/` | Native frontends |
 | `docs/` | Configuration, placeholders, vendor endpoints |
-| `.github/workflows/` | `ci.yml` (fmt, clippy, tests, MSRV 1.88, Nix) and `release.yml` |
+| `.github/workflows/` | `release.yml` (builds and publishes a release when a `v*` tag is pushed) |
 
 Adding a vendor is an exhaustive-match exercise: `VendorId`, `VendorSnapshot`,
 `VendorId::all()`, config section, catalog, detect, widget CLI, TUI fetch,

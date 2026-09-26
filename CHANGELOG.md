@@ -61,6 +61,9 @@ Each release is also published at
 - The README is a shorter overview (features, display modes, install,
   sign-in, usage, configuration, credits to ai-usagebar and claudebar); the
   full reference moved to `docs/guide.md`.
+- No CI on pushes or pull requests and no Dependabot: the `make test` gate
+  runs locally. `release.yml` still builds a release when a `v*` tag is
+  pushed.
 
 - New README front section: display modes with screenshots (example
   accounts only), the `[display]` reference, a per-frontend table, and the

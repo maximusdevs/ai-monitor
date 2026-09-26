@@ -161,7 +161,7 @@ jobs:
 
       # --- Windows -------------------------------------------------------
       # Same nasm requirement as the Linux x86_64 build; the Windows runner
-      # does not ship it on PATH either (mirrors .github/workflows/ci.yml).
+      # does not ship it on PATH either.
       - name: Install nasm (Windows; ring assembles its primitives)
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
