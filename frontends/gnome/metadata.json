@@ -1,0 +1,11 @@
+{
+  "uuid": "ai-monitor@maximusdevs.github.io",
+  "name": "AI Monitor",
+  "description": "Claude, Codex, and other AI plan usage in the GNOME top panel, next to the clock/network: quota bars with the full tooltip in a native dropdown. Backed by the `ai-monitor` binary (https://github.com/maximusdevs/ai-monitor).",
+  "version": 2,
+  "version-name": "0.2.0",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/maximusdevs/ai-monitor",
+  "settings-schema": "org.gnome.shell.extensions.ai-monitor",
+  "gettext-domain": "ai-monitor"
+}

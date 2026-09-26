@@ -1,0 +1,22 @@
+pkgbase = ai-monitor-bin
+	pkgdesc = Omarchy/Waybar widgets + TUI for AI plan usage (prebuilt binary)
+	pkgver = 1.17.0
+	pkgrel = 1
+	url = https://github.com/maximusdevs/ai-monitor
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = gcc-libs
+	optdepends = waybar: status bar that hosts the widget
+	optdepends = libnotify: desktop notifications on hard auth failures
+	provides = ai-monitor=1.17.0
+	conflicts = ai-monitor
+	conflicts = ai-monitor-debug
+	options = !strip
+	options = !debug
+	source_x86_64 = ai-monitor-1.17.0-x86_64.tar.gz::https://github.com/maximusdevs/ai-monitor/releases/download/v1.17.0/ai-monitor-linux-x86_64.tar.gz
+	sha256sums_x86_64 = SKIP
+	source_aarch64 = ai-monitor-1.17.0-aarch64.tar.gz::https://github.com/maximusdevs/ai-monitor/releases/download/v1.17.0/ai-monitor-linux-aarch64.tar.gz
+	sha256sums_aarch64 = SKIP
+
+pkgname = ai-monitor-bin

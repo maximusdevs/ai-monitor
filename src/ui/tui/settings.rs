@@ -1,0 +1,2566 @@
+//! Settings overlay — opened from the TUI by pressing `s`. Lets the user pick
+//! the primary vendor and paste a credential for any API-key-authenticated vendor
+//! (including Z.AI, Kimi, MiniMax, and the balance vendors) without hand-editing
+//! config.toml. Anthropic, OpenAI, GitHub Copilot, Cursor, Kiro, Antigravity, and
+//! Command Code authenticate through official or local product state, so they have
+//! no credential field here — there is nothing to paste, and a field would only
+//! imply otherwise. Kimi keeps
+//! its credential field because a platform key is still one of its two credentials, but
+//! a subscriber whose credential is the Kimi Code CLI login has nothing to paste
+//! and enables `[kimi]` in config.toml instead.
+//!
+//! Persistence uses `toml_edit` so the existing config keeps its comments,
+//! whitespace, and unrelated fields. Writing a key also flips that vendor's
+//! `enabled = true` (the opt-in vendors are disabled by default), so "paste the
+//! credential and save" is all it takes. Files with inline credentials are atomically written
+//! and `chmod 600`ed.
+
+use std::collections::BTreeMap;
+use std::io::BufRead;
+use std::path::{Path, PathBuf};
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
+use ratatui_bubbletea_theme::BubbleTheme;
+use serde::{Deserialize, Serialize};
+use toml_edit::{DocumentMut, value};
+
+use crate::config::{
+    BAR_COUNT_RANGE, BarMode, BarUnit, Config, DisplayConfig, HoverMode, is_valid_env_var_name,
+    read_config_document, set_bool, write_config_document,
+};
+use crate::error::{AppError, Result};
+use crate::theme::Theme;
+use crate::tui::style::bubble_theme;
+use crate::vendor::VendorId;
+
+/// A vendor that authenticates with an inline credential. The order of this
+/// table is the tab order of the credential fields and the layout of the
+/// state's `keys` vec.
+pub struct KeyVendor {
+    pub id: VendorId,
+    pub label: &'static str,
+    pub section: &'static str,
+    /// Config field that stores the credential (`api_key` for most vendors).
+    pub config_key: &'static str,
+    /// Human-readable name shown in the native settings form.
+    pub secret_label: &'static str,
+    /// Extra hint after the env var (e.g. "management key"). Empty for none.
+    pub note: &'static str,
+}
+
+pub const KEY_VENDORS: &[KeyVendor] = &[
+    KeyVendor {
+        id: VendorId::AnthropicApi,
+        label: "Anthropic API",
+        section: VendorId::AnthropicApi.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "admin key — monthly spend",
+    },
+    KeyVendor {
+        id: VendorId::Zai,
+        label: "Z.AI",
+        section: VendorId::Zai.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "",
+    },
+    KeyVendor {
+        id: VendorId::Openrouter,
+        label: "OpenRouter",
+        section: VendorId::Openrouter.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "",
+    },
+    KeyVendor {
+        id: VendorId::Deepseek,
+        label: "DeepSeek",
+        section: VendorId::Deepseek.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "",
+    },
+    KeyVendor {
+        id: VendorId::Kimi,
+        label: "Kimi",
+        section: VendorId::Kimi.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "coding-plan usage",
+    },
+    KeyVendor {
+        id: VendorId::Kilo,
+        label: "Kilo",
+        section: VendorId::Kilo.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "",
+    },
+    KeyVendor {
+        id: VendorId::Novita,
+        label: "Novita",
+        section: VendorId::Novita.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "",
+    },
+    KeyVendor {
+        id: VendorId::Moonshot,
+        label: "Moonshot",
+        section: VendorId::Moonshot.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "account balance",
+    },
+    KeyVendor {
+        id: VendorId::Grok,
+        label: "Grok",
+        section: VendorId::Grok.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "management key, not the inference key",
+    },
+    KeyVendor {
+        id: VendorId::Minimax,
+        label: "MiniMax",
+        section: VendorId::Minimax.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "Token Plan subscription key",
+    },
+    KeyVendor {
+        id: VendorId::OpenCodeGo,
+        label: "OpenCode Go",
+        section: VendorId::OpenCodeGo.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "usage quota",
+    },
+    KeyVendor {
+        id: VendorId::Ollama,
+        label: "Ollama Cloud",
+        section: VendorId::Ollama.config_section(),
+        config_key: "api_key",
+        secret_label: "API key",
+        note: "ollama.com/settings/keys",
+    },
+];
+
+/// Per-provider toggle state in the settings dialog.
+#[derive(Debug, Clone)]
+pub struct ProviderToggle {
+    pub id: VendorId,
+    pub name: &'static str,
+    pub enabled: bool,
+    pub dirty: bool,
+}
+
+/// Which control has keyboard focus. `Provider(i)` indexes into [`VendorId::all()`]. `Key(i)` indexes into [`KEY_VENDORS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Primary,
+    ShowFullEmail,
+    ShowExtraModels,
+    NotifyResets,
+    Display(DisplayRow),
+    /// Per-account "show in panel" toggle, by index into `panel_accounts`.
+    PanelAccount(usize),
+    Provider(usize),
+    Key(usize),
+    Save,
+}
+
+/// One `[display]` row in the overlay, top to bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayRow {
+    Mode,
+    Unit,
+    Count,
+    Interval,
+    Hover,
+    RecentOnly,
+    AccountName,
+}
+
+impl DisplayRow {
+    pub const ALL: [DisplayRow; 7] = [
+        DisplayRow::Mode,
+        DisplayRow::Unit,
+        DisplayRow::Count,
+        DisplayRow::Interval,
+        DisplayRow::Hover,
+        DisplayRow::RecentOnly,
+        DisplayRow::AccountName,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|r| *r == self).unwrap_or(0)
+    }
+}
+
+/// Carousel steps the overlay offers; any value in range is valid in config.
+const CAROUSEL_STEPS: [u64; 9] = [2, 3, 5, 10, 15, 30, 60, 120, 300];
+
+impl Focus {
+    /// The next row down. `accounts` is the number of per-account panel
+    /// toggles, which sit between the display rows and the providers.
+    pub fn next(self, accounts: usize) -> Self {
+        let num_providers = VendorId::all().len();
+        let after_display = if accounts > 0 {
+            Focus::PanelAccount(0)
+        } else {
+            Focus::Provider(0)
+        };
+        match self {
+            Focus::Primary => Focus::ShowFullEmail,
+            Focus::ShowFullEmail => Focus::ShowExtraModels,
+            Focus::ShowExtraModels => Focus::NotifyResets,
+            Focus::NotifyResets => Focus::Display(DisplayRow::ALL[0]),
+            Focus::Display(r) => DisplayRow::ALL
+                .get(r.index() + 1)
+                .map_or(after_display, |next| Focus::Display(*next)),
+            Focus::PanelAccount(i) if i + 1 < accounts => Focus::PanelAccount(i + 1),
+            Focus::PanelAccount(_) => Focus::Provider(0),
+            Focus::Provider(i) if i + 1 < num_providers => Focus::Provider(i + 1),
+            Focus::Provider(_) => Focus::Key(0),
+            Focus::Key(i) if i + 1 < KEY_VENDORS.len() => Focus::Key(i + 1),
+            Focus::Key(_) => Focus::Save,
+            Focus::Save => Focus::Primary,
+        }
+    }
+    pub fn prev(self, accounts: usize) -> Self {
+        let num_providers = VendorId::all().len();
+        let last_display = Focus::Display(DisplayRow::ALL[DisplayRow::ALL.len() - 1]);
+        match self {
+            Focus::Primary => Focus::Save,
+            Focus::ShowFullEmail => Focus::Primary,
+            Focus::ShowExtraModels => Focus::ShowFullEmail,
+            Focus::NotifyResets => Focus::ShowExtraModels,
+            Focus::Display(r) if r.index() == 0 => Focus::NotifyResets,
+            Focus::Display(r) => Focus::Display(DisplayRow::ALL[r.index() - 1]),
+            Focus::PanelAccount(0) => last_display,
+            Focus::PanelAccount(i) => Focus::PanelAccount(i - 1),
+            Focus::Provider(0) if accounts > 0 => Focus::PanelAccount(accounts - 1),
+            Focus::Provider(0) => last_display,
+            Focus::Provider(i) => Focus::Provider(i - 1),
+            Focus::Key(0) => Focus::Provider(num_providers - 1),
+            Focus::Key(i) => Focus::Key(i - 1),
+            Focus::Save => Focus::Key(KEY_VENDORS.len() - 1),
+        }
+    }
+}
+
+/// Per-field text-input state — cursor + buffer + reveal flag.
+#[derive(Debug, Clone, Default)]
+pub struct KeyInput {
+    pub buf: String,
+    /// Char-index cursor position (0..=buf.chars().count()).
+    pub cursor: usize,
+    /// When true, the field renders the actual characters; otherwise `•`.
+    pub revealed: bool,
+    /// True after the user has typed/edited; only then does save write the
+    /// value back (avoids clobbering an existing key with the empty
+    /// placeholder the user opened the dialog with).
+    pub dirty: bool,
+}
+
+impl KeyInput {
+    pub fn from_config(initial: Option<&str>) -> Self {
+        let buf = initial.unwrap_or("").to_string();
+        let cursor = buf.chars().count();
+        Self {
+            buf,
+            cursor,
+            revealed: false,
+            dirty: false,
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let byte_idx = self.char_to_byte(self.cursor);
+        self.buf.insert(byte_idx, c);
+        self.cursor += 1;
+        self.dirty = true;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev_byte = self.char_to_byte(self.cursor - 1);
+        let cur_byte = self.char_to_byte(self.cursor);
+        self.buf.replace_range(prev_byte..cur_byte, "");
+        self.cursor -= 1;
+        self.dirty = true;
+    }
+
+    pub fn delete(&mut self) {
+        let n = self.buf.chars().count();
+        if self.cursor >= n {
+            return;
+        }
+        let cur_byte = self.char_to_byte(self.cursor);
+        let next_byte = self.char_to_byte(self.cursor + 1);
+        self.buf.replace_range(cur_byte..next_byte, "");
+        self.dirty = true;
+    }
+
+    pub fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+    pub fn move_right(&mut self) {
+        if self.cursor < self.buf.chars().count() {
+            self.cursor += 1;
+        }
+    }
+    pub fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+    pub fn move_end(&mut self) {
+        self.cursor = self.buf.chars().count();
+    }
+    pub fn toggle_reveal(&mut self) {
+        self.revealed = !self.revealed;
+    }
+
+    /// Render for display — bullets when masked, raw chars when revealed.
+    pub fn display(&self) -> String {
+        if self.revealed {
+            self.buf.clone()
+        } else {
+            "•".repeat(self.buf.chars().count())
+        }
+    }
+
+    fn char_to_byte(&self, char_idx: usize) -> usize {
+        self.buf
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain(std::iter::once(self.buf.len()))
+            .nth(char_idx)
+            .unwrap_or(self.buf.len())
+    }
+}
+
+/// Mutable state of the overlay while open.
+#[derive(Debug, Clone)]
+pub struct SettingsState {
+    pub focus: Focus,
+    /// Enabled vendors only. The primary selector must not offer a value that
+    /// cannot actually be used by the widget or TUI.
+    pub primary_choices: Vec<VendorId>,
+    pub primary: VendorId,
+    /// Toggleable AI providers (all supported vendors).
+    pub providers: Vec<ProviderToggle>,
+    /// One input per [`KEY_VENDORS`] entry, same order.
+    pub keys: Vec<KeyInput>,
+    /// Whether to display full email addresses.
+    pub show_full_email: Option<bool>,
+    /// Whether to display extra model info in Antigravity.
+    pub show_extra_models: Option<bool>,
+    /// Whether to notify on desktop when account quotas reset.
+    pub notify_resets: Option<bool>,
+    /// `ui.multi_account`, only when changed through the native bridge; the
+    /// overlay has no row for it and must not write a default back.
+    pub multi_account: Option<bool>,
+    /// `ui.refresh_interval`, same rule as `multi_account`.
+    pub refresh_interval: Option<u64>,
+    /// The `[display]` section being edited, with every field resolved.
+    pub display: DisplayConfig,
+    /// Set once a display row changes; an untouched section is not written.
+    pub display_dirty: bool,
+    /// Configured account labels, each offered as a "show in panel" toggle.
+    pub panel_accounts: Vec<String>,
+    /// One-line status displayed in the footer ("saved …", "save failed …").
+    pub status: String,
+}
+
+impl SettingsState {
+    pub fn from_config(cfg: &Config) -> Self {
+        Self::from_config_with(cfg, |name| {
+            std::env::var_os(name).is_some_and(|v| !v.is_empty())
+        })
+    }
+
+    /// [`Self::from_config`] with an injected environment lookup.
+    ///
+    /// The overlay offers a key-only vendor whose env var is already exported,
+    /// so a user need not hand-edit `config.toml` to select it. That is a read
+    /// of ambient state, which a test must never depend on: the AUR `check()`
+    /// runs `cargo test` during `makepkg`, so a test that branched on the real
+    /// environment would fail the install for anyone who exports, say,
+    /// `OLLAMA_API_KEY`. Tests pass their own lookup here.
+    pub fn from_config_with(cfg: &Config, env_set: impl Fn(&str) -> bool) -> Self {
+        let providers: Vec<ProviderToggle> = VendorId::all()
+            .iter()
+            .map(|id| ProviderToggle {
+                id: *id,
+                name: id.display_name(),
+                enabled: cfg.is_enabled(*id),
+                dirty: false,
+            })
+            .collect();
+        let keys = KEY_VENDORS
+            .iter()
+            .map(|kv| KeyInput::from_config(cfg.inline_api_key(kv.id)))
+            .collect();
+        let mut primary_choices = cfg.enabled_vendors();
+        // Copilot credentials belong to GitHub CLI, so a login cannot write a
+        // local key that would also opt it in. Offer it explicitly instead:
+        // selecting it persists both the primary and `enabled = true`.
+        if !primary_choices.contains(&VendorId::Copilot) {
+            primary_choices.push(VendorId::Copilot);
+        }
+        // Key-only vendors are opt-in: without an inline `api_key` and with
+        // the env var empty, the fetch would fail on the first cycle. A user
+        // who already exported the env var (e.g. `OLLAMA_API_KEY`) and wants
+        // to flip `enabled = true` from inside the TUI has to be able to
+        // select the vendor here — otherwise they'd have to hand-edit
+        // `config.toml`, which is the workflow this overlay exists to avoid.
+        // We treat a non-empty env var as a sufficient signal of reachability.
+        for kv in KEY_VENDORS {
+            if primary_choices.contains(&kv.id) {
+                continue;
+            }
+            let env = cfg.api_key_env_for(kv.id);
+            let exported = is_valid_env_var_name(env) && env_set(env);
+            if cfg.inline_api_key(kv.id).is_some() || exported {
+                primary_choices.push(kv.id);
+            }
+        }
+        // A configured but disabled primary is ineffective. Display the first
+        // enabled vendor instead; when none are enabled retain the historical
+        // Anthropic fallback in memory without inventing a persisted primary.
+        let primary = cfg
+            .ui
+            .primary
+            .filter(|vendor| {
+                primary_choices.contains(vendor)
+                    && (*vendor != VendorId::Copilot || cfg.copilot.enabled)
+            })
+            .or_else(|| primary_choices.first().copied())
+            .unwrap_or_else(|| cfg.ui.primary.unwrap_or(VendorId::Anthropic));
+        Self {
+            focus: Focus::Primary,
+            primary_choices,
+            primary,
+            providers,
+            keys,
+            show_full_email: Some(cfg.ui.show_full_email()),
+            show_extra_models: Some(cfg.ui.show_extra_models()),
+            notify_resets: Some(cfg.ui.notify_resets()),
+            multi_account: None,
+            refresh_interval: None,
+            display: cfg.display.resolved(),
+            display_dirty: false,
+            panel_accounts: cfg.accounts.iter().map(|a| a.label.clone()).collect(),
+            status: String::new(),
+        }
+    }
+
+    /// Whether the provider with `id` is currently enabled in settings.
+    pub fn is_provider_enabled(&self, id: VendorId) -> bool {
+        self.providers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.enabled)
+            .unwrap_or(false)
+    }
+
+    /// The focused key input, if a key row is focused.
+    fn focused_key_mut(&mut self) -> Option<&mut KeyInput> {
+        match self.focus {
+            Focus::Key(i) => self.keys.get_mut(i),
+            _ => None,
+        }
+    }
+}
+
+/// What the key handler asks the host app to do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Stay open, keep listening for keys.
+    Continue,
+    /// Close the overlay (discard or save already happened).
+    Close,
+    /// Save just succeeded — caller should refresh affected vendors.
+    SavedAndClose,
+    /// Quit the host TUI. Ctrl-C remains global even while the overlay owns
+    /// keyboard focus.
+    Quit,
+}
+
+/// Permission note appended to the "saved" status line. The overlay `chmod
+/// 600`s the file on Unix; Windows has no such step, so the note is empty there.
+#[cfg(unix)]
+const PERMS_NOTE: &str = " (chmod 600)";
+#[cfg(not(unix))]
+const PERMS_NOTE: &str = "";
+
+fn saved_status() -> String {
+    format!(
+        "saved to {}{}",
+        crate::config::config_path_hint(),
+        PERMS_NOTE
+    )
+}
+
+/// Key map. Returns the action to perform after the keypress.
+pub fn handle_key(state: &mut SettingsState, code: KeyCode, mods: KeyModifiers) -> Action {
+    if matches!(code, KeyCode::Esc) {
+        return Action::Close;
+    }
+    if matches!(code, KeyCode::Char('c')) && mods.contains(KeyModifiers::CONTROL) {
+        return Action::Quit;
+    }
+    // Ctrl-S triggers save from any field.
+    if matches!(code, KeyCode::Char('s')) && mods.contains(KeyModifiers::CONTROL) {
+        return try_save(state);
+    }
+    if matches!(code, KeyCode::Char('v')) && mods.contains(KeyModifiers::CONTROL) {
+        if let Some(input) = state.focused_key_mut() {
+            input.toggle_reveal();
+        }
+        return Action::Continue;
+    }
+    match code {
+        KeyCode::Tab => {
+            state.focus = match state.focus {
+                Focus::Primary => Focus::ShowFullEmail,
+                Focus::ShowFullEmail | Focus::ShowExtraModels | Focus::NotifyResets => {
+                    Focus::Display(DisplayRow::ALL[0])
+                }
+                Focus::Display(_) | Focus::PanelAccount(_) => Focus::Provider(0),
+                Focus::Provider(_) => Focus::Key(0),
+                Focus::Key(_) => Focus::Save,
+                Focus::Save => Focus::Primary,
+            };
+            return Action::Continue;
+        }
+        KeyCode::BackTab => {
+            state.focus = match state.focus {
+                Focus::Primary => Focus::Save,
+                Focus::ShowFullEmail | Focus::ShowExtraModels | Focus::NotifyResets => {
+                    Focus::Primary
+                }
+                Focus::Display(_) | Focus::PanelAccount(_) => Focus::ShowFullEmail,
+                Focus::Provider(_) => Focus::Display(DisplayRow::ALL[0]),
+                Focus::Key(_) => Focus::Provider(0),
+                Focus::Save => Focus::Key(0),
+            };
+            return Action::Continue;
+        }
+        KeyCode::Down => {
+            state.focus = state.focus.next(state.panel_accounts.len());
+            return Action::Continue;
+        }
+        KeyCode::Up => {
+            state.focus = state.focus.prev(state.panel_accounts.len());
+            return Action::Continue;
+        }
+        _ => {}
+    }
+
+    // A modifier chord is not text. The overlay swallows every key while open,
+    // so every unhandled chord must be ignored rather than corrupting the
+    // secret silently. SHIFT is deliberately not rejected — it is how
+    // uppercase arrives. Ctrl-C was handled above because it is a global quit.
+    if matches!(code, KeyCode::Char(_))
+        && mods.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        )
+    {
+        return Action::Continue;
+    }
+
+    // Field-specific handling.
+    match state.focus {
+        Focus::Primary => handle_primary(state, code),
+        Focus::ShowFullEmail => {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+                state.show_full_email = Some(!state.show_full_email.unwrap_or(true));
+            }
+        }
+        Focus::ShowExtraModels => {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+                state.show_extra_models = Some(!state.show_extra_models.unwrap_or(false));
+            }
+        }
+        Focus::NotifyResets => {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Enter) {
+                state.notify_resets = Some(!state.notify_resets.unwrap_or(true));
+            }
+        }
+        Focus::Display(row) => handle_display(state, row, code),
+        Focus::PanelAccount(i) => {
+            if matches!(code, KeyCode::Char(' ') | KeyCode::Enter)
+                && let Some(label) = state.panel_accounts.get(i).cloned()
+            {
+                let hidden = state.display.hidden_accounts.get_or_insert_with(Vec::new);
+                if let Some(pos) = hidden.iter().position(|h| *h == label) {
+                    hidden.remove(pos);
+                } else {
+                    hidden.push(label);
+                }
+                state.display_dirty = true;
+            }
+        }
+        Focus::Provider(i) => handle_provider(state, i, code),
+        Focus::Key(i) => {
+            if let Some(input) = state.keys.get_mut(i) {
+                handle_input(input, code);
+            }
+        }
+        Focus::Save => {
+            if matches!(code, KeyCode::Enter) {
+                return try_save(state);
+            }
+        }
+    }
+    Action::Continue
+}
+
+/// Space/Enter/→ step a display row forward, ← steps it back.
+fn handle_display(state: &mut SettingsState, row: DisplayRow, code: KeyCode) {
+    let forward = match code {
+        KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Right => true,
+        KeyCode::Left => false,
+        _ => return,
+    };
+    let d = &mut state.display;
+    match row {
+        DisplayRow::Mode => d.bar_mode = Some(d.bar_mode().toggled()),
+        DisplayRow::Unit => d.bar_unit = Some(d.bar_unit().toggled()),
+        DisplayRow::Hover => d.hover_mode = Some(d.hover_mode().toggled()),
+        DisplayRow::RecentOnly => d.recent_only = Some(!d.recent_only()),
+        DisplayRow::AccountName => d.show_account_name = Some(!d.show_account_name()),
+        DisplayRow::Count => {
+            let (lo, hi) = (*BAR_COUNT_RANGE.start(), *BAR_COUNT_RANGE.end());
+            let n = d.bar_count();
+            // Wraps, so Space alone reaches every value.
+            d.bar_count = Some(if forward {
+                if n >= hi { lo } else { n + 1 }
+            } else if n <= lo {
+                hi
+            } else {
+                n - 1
+            });
+        }
+        DisplayRow::Interval => {
+            let cur = d.carousel_interval();
+            let at = CAROUSEL_STEPS.iter().position(|s| *s >= cur).unwrap_or(0);
+            let len = CAROUSEL_STEPS.len();
+            let next = if forward {
+                (at + 1) % len
+            } else {
+                (at + len - 1) % len
+            };
+            d.carousel_interval = Some(CAROUSEL_STEPS[next]);
+        }
+    }
+    state.display_dirty = true;
+}
+
+fn handle_provider(state: &mut SettingsState, i: usize, code: KeyCode) {
+    const ROWS: usize = 7;
+    let n = state.providers.len();
+    match code {
+        KeyCode::Left => {
+            if i >= ROWS {
+                state.focus = Focus::Provider(i - ROWS);
+            }
+        }
+        KeyCode::Right => {
+            if i + ROWS < n {
+                state.focus = Focus::Provider(i + ROWS);
+            }
+        }
+        KeyCode::Char(' ') | KeyCode::Enter => {
+            if let Some(p) = state.providers.get_mut(i) {
+                p.enabled = !p.enabled;
+                p.dirty = true;
+                let id = p.id;
+                let enabled = p.enabled;
+                if enabled {
+                    if !state.primary_choices.contains(&id) {
+                        state.primary_choices.push(id);
+                    }
+                } else if state.primary == id
+                    && let Some(other) =
+                        state.primary_choices.iter().copied().find(|other_id| {
+                            *other_id != id && state.is_provider_enabled(*other_id)
+                        })
+                {
+                    state.primary = other;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn try_save(state: &mut SettingsState) -> Action {
+    match save_to_config_default(state) {
+        Ok(()) => {
+            state.status = saved_status();
+            Action::SavedAndClose
+        }
+        Err(e) => {
+            state.status = format!("save failed: {e}");
+            Action::Continue
+        }
+    }
+}
+
+fn handle_primary(state: &mut SettingsState, code: KeyCode) {
+    // Left/Right cycles the primary-vendor radio over enabled vendors only.
+    let choices = &state.primary_choices;
+    let Some(idx) = choices.iter().position(|v| *v == state.primary) else {
+        return;
+    };
+    let step = match code {
+        KeyCode::Left => -1,
+        KeyCode::Right | KeyCode::Char(' ') => 1,
+        _ => return,
+    };
+    state.primary = choices[((idx as i32 + step).rem_euclid(choices.len() as i32)) as usize];
+}
+
+fn handle_input(input: &mut KeyInput, code: KeyCode) {
+    match code {
+        KeyCode::Char(c) => input.insert_char(c),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete(),
+        KeyCode::Left => input.move_left(),
+        KeyCode::Right => input.move_right(),
+        KeyCode::Home => input.move_home(),
+        KeyCode::End => input.move_end(),
+        _ => {}
+    }
+}
+
+/// Save to the platform config path (creating it). On success, signal a running
+/// Waybar (`SIGRTMIN+13`) so a `signal: 13` module refreshes immediately.
+fn save_to_config_default(state: &SettingsState) -> Result<()> {
+    let path = default_config_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| AppError::io_at(parent, e))?;
+    }
+    save_to_path(state, &path)?;
+    crate::waybar::request_refresh();
+    Ok(())
+}
+
+/// Same as `save_to_config_default` but with an explicit path — exposed for
+/// tests. Writing a non-empty credential also sets that vendor's `enabled = true`.
+pub fn save_to_path(state: &SettingsState, path: &Path) -> Result<()> {
+    let mut doc = read_config_document(path)?;
+
+    // Remove fields written by the short-lived inline Copilot-token design.
+    // GitHub CLI owns the OAuth credential now; retaining a secret this app
+    // neither reads nor supports would be misleading and unsafe.
+    if let Some(table) = doc
+        .get_mut("copilot")
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        table.remove("token");
+        table.remove("token_env");
+    }
+
+    // Only Copilot is deliberately offered before it is enabled: choosing it
+    // is the explicit opt-in after the GitHub CLI login. The env-only key
+    // vendors (any `KEY_VENDORS` entry whose credential the user reached via
+    // `OLLAMA_API_KEY` or another env var) are also offered before they are
+    // enabled, and selecting them is the explicit opt-in for that vendor —
+    // otherwise a user could pick a vendor in the overlay and the fetch
+    // would still fail because `enabled = false`. Every other choice remains
+    // enabled-only, so no failed provider is persisted as primary.
+    if state.primary_choices.contains(&state.primary) {
+        set_string(&mut doc, "ui", "primary", state.primary.slug())?;
+        if state.primary == VendorId::Copilot || KEY_VENDORS.iter().any(|kv| kv.id == state.primary)
+        {
+            set_bool(&mut doc, state.primary.config_section(), "enabled", true)?;
+        }
+    }
+
+    if let Some(sfe) = state.show_full_email {
+        set_bool(&mut doc, "ui", "show_full_email", sfe)?;
+    }
+    if let Some(sem) = state.show_extra_models {
+        set_bool(&mut doc, "ui", "show_extra_models", sem)?;
+    }
+    if let Some(nr) = state.notify_resets {
+        set_bool(&mut doc, "ui", "notify_resets", nr)?;
+    }
+    if let Some(multi) = state.multi_account {
+        set_bool(&mut doc, "ui", "multi_account", multi)?;
+    }
+    if let Some(secs) = state.refresh_interval {
+        crate::config::set_value(
+            &mut doc,
+            "ui",
+            "refresh_interval",
+            Some((secs as i64).into()),
+        )?;
+    }
+    if state.display_dirty {
+        state.display.write_to(&mut doc)?;
+    }
+
+    for p in &state.providers {
+        if p.dirty {
+            set_bool(&mut doc, p.id.config_section(), "enabled", p.enabled)?;
+        }
+    }
+
+    for (i, kv) in KEY_VENDORS.iter().enumerate() {
+        let Some(input) = state.keys.get(i) else {
+            continue;
+        };
+        update_key(&mut doc, kv, input)?;
+    }
+
+    write_config_document(path, &doc)
+}
+
+/// Apply one credential field to the document. Untouched fields are left
+/// alone; a field the user cleared is *removed*, so an inline secret can be
+/// deleted from the overlay rather than lingering in the file. Writing a
+/// non-empty credential also opts the vendor in — the opt-in vendors would
+/// otherwise never fetch.
+fn update_key(doc: &mut DocumentMut, vendor: &KeyVendor, input: &KeyInput) -> Result<()> {
+    if !input.dirty {
+        return Ok(());
+    }
+    if input.buf.is_empty() {
+        if let Some(table) = doc
+            .get_mut(vendor.section)
+            .and_then(toml_edit::Item::as_table_mut)
+        {
+            table.remove(vendor.config_key);
+        }
+        return Ok(());
+    }
+    set_string(doc, vendor.section, vendor.config_key, &input.buf)?;
+    set_bool(doc, vendor.section, "enabled", true)
+}
+
+/// Set or update a string field in a TOML section, preserving comments and
+/// formatting of unaffected nodes.
+fn set_string(doc: &mut DocumentMut, section: &str, key: &str, new_value: &str) -> Result<()> {
+    let table = doc
+        .entry(section)
+        .or_insert_with(toml_edit::table)
+        .as_table_mut()
+        .ok_or_else(|| AppError::Other(format!("config.toml: [{section}] is not a table")))?;
+
+    if let Some(item) = table.get_mut(key)
+        && let Some(v) = item.as_value_mut()
+    {
+        *v = toml_edit::Value::from(new_value);
+        v.decor_mut().set_prefix(" ");
+        return Ok(());
+    }
+    table.insert(key, value(new_value));
+    Ok(())
+}
+
+fn default_config_path() -> Result<PathBuf> {
+    // Save back to the same file Config::load() selected. On macOS this may be
+    // the legacy ~/.config path when the canonical Application Support file is
+    // absent; writing a new canonical file would shadow the existing config on
+    // the next load and silently discard all settings the overlay did not copy.
+    crate::config::resolved_path()
+        .ok_or_else(|| AppError::Other("could not resolve config dir".into()))
+}
+
+// ─── Native frontend bridge ───────────────────────────────────────────────
+
+/// Versioned, non-secret description consumed by native desktop frontends.
+/// Inline key values are deliberately represented only as booleans: a
+/// long-lived shell process never needs to receive credentials just to draw a
+/// settings form.
+#[derive(Debug, Serialize)]
+struct SettingsSnapshot {
+    schema_version: u8,
+    primary: String,
+    primary_choices: Vec<PrimaryChoice>,
+    keys: Vec<KeyStatus>,
+    show_full_email: bool,
+    show_extra_models: bool,
+    notify_resets: bool,
+    refresh_interval: u64,
+    multi_account: bool,
+    /// `[display]` with every field resolved.
+    display: DisplayConfig,
+    /// Configured account labels, for a "show in panel" list.
+    accounts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrimaryChoice {
+    id: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyStatus {
+    id: String,
+    label: String,
+    environment: String,
+    secret_label: String,
+    note: String,
+    configured: bool,
+    inline_configured: bool,
+    environment_configured: bool,
+}
+
+/// Additive patch accepted on stdin by `ai-monitor settings apply`.
+/// Missing keys remain byte-for-byte untouched. `clear` explicitly removes an
+/// inline key, matching the TUI overlay's existing empty-dirty-field behavior.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApplyRequest {
+    schema_version: u8,
+    primary: Option<String>,
+    #[serde(default)]
+    keys: BTreeMap<String, KeyMutation>,
+    /// Fields present here replace the saved `[display]` ones; absent fields
+    /// keep theirs. `hidden_accounts` is replaced as a whole list.
+    display: Option<DisplayConfig>,
+    show_full_email: Option<bool>,
+    show_extra_models: Option<bool>,
+    notify_resets: Option<bool>,
+    refresh_interval: Option<u64>,
+    multi_account: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase", deny_unknown_fields)]
+enum KeyMutation {
+    Set { value: String },
+    Clear,
+}
+
+const SETTINGS_SCHEMA_VERSION: u8 = 1;
+const MAX_SETTINGS_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_API_KEY_BYTES: usize = 16 * 1024;
+
+fn snapshot_from_config_with(
+    cfg: &Config,
+    environment_configured: impl Fn(&str) -> bool,
+) -> SettingsSnapshot {
+    let state = SettingsState::from_config(cfg);
+    let primary_choices = state
+        .primary_choices
+        .iter()
+        .map(|id| PrimaryChoice {
+            id: id.slug().to_string(),
+            label: id.display_name().to_string(),
+        })
+        .collect();
+    let keys = KEY_VENDORS
+        .iter()
+        .map(|vendor| {
+            let environment = cfg.api_key_env_for(vendor.id);
+            let inline_configured = cfg.inline_api_key(vendor.id).is_some();
+            let environment_configured = environment_configured(environment);
+            KeyStatus {
+                id: vendor.id.slug().to_string(),
+                label: vendor.label.to_string(),
+                environment: environment.to_string(),
+                secret_label: vendor.secret_label.to_string(),
+                note: vendor.note.to_string(),
+                configured: inline_configured || environment_configured,
+                inline_configured,
+                environment_configured,
+            }
+        })
+        .collect();
+    SettingsSnapshot {
+        schema_version: SETTINGS_SCHEMA_VERSION,
+        primary: state.primary.slug().to_string(),
+        primary_choices,
+        keys,
+        show_full_email: cfg.ui.show_full_email(),
+        show_extra_models: cfg.ui.show_extra_models(),
+        notify_resets: cfg.ui.notify_resets(),
+        refresh_interval: cfg.ui.refresh_interval(),
+        multi_account: cfg.ui.multi_account(),
+        display: state.display,
+        accounts: state.panel_accounts,
+    }
+}
+
+fn settings_snapshot_json(cfg: &Config) -> Result<String> {
+    Ok(serde_json::to_string(&snapshot_from_config_with(
+        cfg,
+        |environment| std::env::var_os(environment).is_some_and(|value| !value.is_empty()),
+    ))?)
+}
+
+#[cfg(test)]
+fn settings_snapshot_json_with(
+    cfg: &Config,
+    environment_configured: impl Fn(&str) -> bool,
+) -> Result<String> {
+    Ok(serde_json::to_string(&snapshot_from_config_with(
+        cfg,
+        environment_configured,
+    ))?)
+}
+
+fn vendor_from_slug(slug: &str) -> Option<VendorId> {
+    VendorId::all().iter().copied().find(|id| id.slug() == slug)
+}
+
+fn state_from_apply_request(cfg: &Config, raw: &str) -> Result<SettingsState> {
+    let request: ApplyRequest = serde_json::from_str(raw)?;
+    if request.schema_version != SETTINGS_SCHEMA_VERSION {
+        return Err(AppError::Other(format!(
+            "unsupported settings schema version {}",
+            request.schema_version
+        )));
+    }
+
+    let mut state = SettingsState::from_config(cfg);
+    if request.show_full_email.is_some() {
+        state.show_full_email = request.show_full_email;
+    }
+    if request.show_extra_models.is_some() {
+        state.show_extra_models = request.show_extra_models;
+    }
+    if request.notify_resets.is_some() {
+        state.notify_resets = request.notify_resets;
+    }
+    if let Some(secs) = request.refresh_interval {
+        if !(5..=3600).contains(&secs) {
+            return Err(AppError::Other(format!(
+                "refresh_interval {secs} is outside 5-3600 seconds"
+            )));
+        }
+        state.refresh_interval = Some(secs);
+    }
+    state.multi_account = request.multi_account;
+    if let Some(patch) = request.display {
+        let d = &mut state.display;
+        d.bar_mode = patch.bar_mode.or(d.bar_mode);
+        d.bar_unit = patch.bar_unit.or(d.bar_unit);
+        d.hover_mode = patch.hover_mode.or(d.hover_mode);
+        d.bar_count = patch.bar_count.or(d.bar_count);
+        d.carousel_interval = patch.carousel_interval.or(d.carousel_interval);
+        d.recent_only = patch.recent_only.or(d.recent_only);
+        d.show_account_name = patch.show_account_name.or(d.show_account_name);
+        if patch.hidden_accounts.is_some() {
+            d.hidden_accounts = patch.hidden_accounts;
+        }
+        state.display_dirty = true;
+    }
+    if let Some(primary) = request.primary {
+        let id = vendor_from_slug(&primary)
+            .ok_or_else(|| AppError::Other(format!("unknown primary vendor {primary:?}")))?;
+        if !state.primary_choices.contains(&id) {
+            return Err(AppError::Other(format!(
+                "primary vendor {primary:?} is not enabled"
+            )));
+        }
+        state.primary = id;
+    }
+
+    for (id, mutation) in request.keys {
+        let index = KEY_VENDORS
+            .iter()
+            .position(|vendor| vendor.id.slug() == id)
+            .ok_or_else(|| AppError::Other(format!("unknown credential vendor {id:?}")))?;
+        let input = &mut state.keys[index];
+        match mutation {
+            KeyMutation::Set { value } => {
+                if value.is_empty() {
+                    return Err(AppError::Other(format!(
+                        "{} for {id:?} is empty; use the clear action to remove it",
+                        KEY_VENDORS[index].secret_label
+                    )));
+                }
+                if value.len() > MAX_API_KEY_BYTES {
+                    return Err(AppError::Other(format!(
+                        "{} for {id:?} exceeds {MAX_API_KEY_BYTES} bytes",
+                        KEY_VENDORS[index].secret_label
+                    )));
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(AppError::Other(format!(
+                        "{} for {id:?} contains control characters",
+                        KEY_VENDORS[index].secret_label
+                    )));
+                }
+                input.buf = value;
+            }
+            KeyMutation::Clear => input.buf.clear(),
+        }
+        input.cursor = input.buf.chars().count();
+        input.dirty = true;
+        input.revealed = false;
+    }
+    Ok(state)
+}
+
+#[cfg(test)]
+fn apply_settings_json_to_path(cfg: &Config, raw: &str, path: &Path) -> Result<()> {
+    let state = state_from_apply_request(cfg, raw)?;
+    save_to_path(&state, path)
+}
+
+fn read_settings_request<R: BufRead>(reader: R) -> Result<String> {
+    let mut limited = reader.take(MAX_SETTINGS_REQUEST_BYTES + 1);
+    let mut bytes = Vec::new();
+    limited.read_until(b'\n', &mut bytes)?;
+    if bytes.len() as u64 > MAX_SETTINGS_REQUEST_BYTES {
+        return Err(AppError::Other(format!(
+            "settings request exceeds {MAX_SETTINGS_REQUEST_BYTES} bytes"
+        )));
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| AppError::Other("settings request is not valid UTF-8".into()))
+}
+
+fn apply_settings_from_stdin() -> Result<()> {
+    let raw = read_settings_request(std::io::stdin().lock())?;
+    let cfg = Config::load()?;
+    let state = state_from_apply_request(&cfg, &raw)?;
+    save_to_config_default(&state)
+}
+
+/// Administrative settings bridge for native frontends. `show` never emits a
+/// secret; `apply` accepts its patch only over stdin so keys do not appear in
+/// argv or the process environment.
+pub fn run_cli(action: &crate::widget::cli::SettingsAction) -> i32 {
+    let result = match action {
+        crate::widget::cli::SettingsAction::Show => Config::load()
+            .and_then(|cfg| settings_snapshot_json(&cfg))
+            .map(|json| println!("{json}")),
+        crate::widget::cli::SettingsAction::Apply => {
+            apply_settings_from_stdin().map(|()| println!(r#"{{"ok":true}}"#))
+        }
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("settings: {error}");
+            1
+        }
+    }
+}
+
+// ─── Render ────────────────────────────────────────────────────────────────
+
+/// Render the modal overlay over `area`.
+pub fn render(f: &mut Frame, area: Rect, state: &SettingsState, theme: &Theme) {
+    let modal = centered_rect(74, 88, area);
+    f.render_widget(Clear, modal);
+
+    let bubble = bubble_theme(theme);
+    let block = bubble.titled_modal_block(" Settings ");
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+
+    // Body (everything but the pinned hint) + a 1-line hint footer.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    // — Primary vendor + providers + credentials header —
+    let mut lines: Vec<Line> = vec![
+        section_header("Primary vendor", "shown first on the bar / TUI", &bubble),
+        primary_line(state, &bubble),
+        Line::from(""),
+        section_header("Display options", "Space/Enter to toggle", &bubble),
+    ];
+
+    let email_focused = state.focus == Focus::ShowFullEmail;
+    let sfe = state.show_full_email.unwrap_or(true);
+    let sfe_mark = if email_focused { "▸ " } else { "  " };
+    let sfe_check = if sfe { "[x] " } else { "[ ] " };
+    lines.push(Line::from(vec![
+        bubble.span("  "),
+        Span::styled(
+            sfe_mark,
+            if email_focused {
+                bubble.accent.add_modifier(Modifier::BOLD)
+            } else {
+                bubble.muted
+            },
+        ),
+        Span::styled(
+            sfe_check,
+            if sfe {
+                bubble.accent.add_modifier(Modifier::BOLD)
+            } else {
+                bubble.muted
+            },
+        ),
+        Span::styled(
+            "Show full email (user@domain.com vs username)",
+            if email_focused {
+                bubble
+                    .selected
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                bubble.title
+            },
+        ),
+    ]));
+
+    let extra_focused = state.focus == Focus::ShowExtraModels;
+    let sem = state.show_extra_models.unwrap_or(false);
+    let sem_mark = if extra_focused { "▸ " } else { "  " };
+    let sem_check = if sem { "[x] " } else { "[ ] " };
+    lines.push(Line::from(vec![
+        bubble.span("  "),
+        Span::styled(
+            sem_mark,
+            if extra_focused {
+                bubble.accent.add_modifier(Modifier::BOLD)
+            } else {
+                bubble.muted
+            },
+        ),
+        Span::styled(
+            sem_check,
+            if sem {
+                bubble.accent.add_modifier(Modifier::BOLD)
+            } else {
+                bubble.muted
+            },
+        ),
+        Span::styled(
+            "Show extra models (Claude & GPT in Antigravity)",
+            if extra_focused {
+                bubble
+                    .selected
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                bubble.title
+            },
+        ),
+    ]));
+
+    let notif_focused = state.focus == Focus::NotifyResets;
+    let nr = state.notify_resets.unwrap_or(true);
+    let nr_mark = if notif_focused { "▸ " } else { "  " };
+    let nr_check = if nr { "[x] " } else { "[ ] " };
+    lines.push(Line::from(vec![
+        bubble.span("  "),
+        Span::styled(
+            nr_mark,
+            if notif_focused {
+                bubble.accent.add_modifier(Modifier::BOLD)
+            } else {
+                bubble.muted
+            },
+        ),
+        Span::styled(
+            nr_check,
+            if nr {
+                bubble.accent.add_modifier(Modifier::BOLD)
+            } else {
+                bubble.muted
+            },
+        ),
+        Span::styled(
+            "Notify on desktop when account quotas reset",
+            if notif_focused {
+                bubble
+                    .selected
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                bubble.title
+            },
+        ),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(section_header(
+        "Panel display",
+        "←→/Space to change · every frontend",
+        &bubble,
+    ));
+    let display_first = lines.len();
+    let d = &state.display;
+    for row in DisplayRow::ALL {
+        let (name, value) = match row {
+            DisplayRow::Mode => (
+                "Bar mode",
+                match d.bar_mode() {
+                    BarMode::Expanded => "expanded (side by side)".to_string(),
+                    BarMode::Carousel => "carousel (one at a time)".to_string(),
+                },
+            ),
+            DisplayRow::Unit => (
+                "Bar item",
+                match d.bar_unit() {
+                    BarUnit::Provider => "provider".to_string(),
+                    BarUnit::Account => "account (with its providers)".to_string(),
+                },
+            ),
+            DisplayRow::Count => ("Items side by side", d.bar_count().to_string()),
+            DisplayRow::Interval => ("Carousel step", format!("{} s", d.carousel_interval())),
+            DisplayRow::Hover => (
+                "Tooltip",
+                match d.hover_mode() {
+                    HoverMode::Blocks => "blocks (everything)".to_string(),
+                    HoverMode::Pager => "pager (one, with arrows)".to_string(),
+                },
+            ),
+            DisplayRow::RecentOnly => (
+                "Recent providers only",
+                if d.recent_only() { "on" } else { "off" }.to_string(),
+            ),
+            DisplayRow::AccountName => (
+                "Account name on bar",
+                if d.show_account_name() { "on" } else { "off" }.to_string(),
+            ),
+        };
+        let focused = state.focus == Focus::Display(row);
+        lines.push(Line::from(vec![
+            bubble.span("  "),
+            Span::styled(
+                if focused { "▸ " } else { "  " },
+                if focused {
+                    bubble.accent.add_modifier(Modifier::BOLD)
+                } else {
+                    bubble.muted
+                },
+            ),
+            Span::styled(
+                format!("{name:<22}"),
+                if focused {
+                    bubble
+                        .selected
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    bubble.title
+                },
+            ),
+            Span::styled(format!(" ◀ {value} ▶"), bubble.accent),
+        ]));
+    }
+    let accounts_first = lines.len();
+    for (i, label) in state.panel_accounts.iter().enumerate() {
+        let shown = !d.hidden_accounts().contains(label);
+        let focused = state.focus == Focus::PanelAccount(i);
+        lines.push(Line::from(vec![
+            bubble.span("      "),
+            Span::styled(
+                if focused { "▸ " } else { "  " },
+                if focused {
+                    bubble.accent.add_modifier(Modifier::BOLD)
+                } else {
+                    bubble.muted
+                },
+            ),
+            Span::styled(
+                if shown { "[x] " } else { "[ ] " },
+                if shown { bubble.accent } else { bubble.muted },
+            ),
+            Span::styled(
+                format!("show {label} in the panel"),
+                if focused {
+                    bubble
+                        .selected
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    bubble.title
+                },
+            ),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(section_header(
+        "Providers",
+        "Space/Enter to toggle on/off",
+        &bubble,
+    ));
+    let providers_first = lines.len();
+
+    const ROWS: usize = 7;
+    const COLS: usize = 3;
+    for row in 0..ROWS {
+        let mut spans = vec![bubble.span("  ")];
+        for col in 0..COLS {
+            let idx = col * ROWS + row;
+            if let Some(p) = state.providers.get(idx) {
+                let is_focused = state.focus == Focus::Provider(idx);
+                let mark = if is_focused { "▸ " } else { "  " };
+                let mark_style = if is_focused {
+                    bubble.accent.add_modifier(Modifier::BOLD)
+                } else {
+                    bubble.muted
+                };
+                spans.push(Span::styled(mark, mark_style));
+
+                let check = if p.enabled { "[x] " } else { "[ ] " };
+                let check_style = if p.enabled {
+                    bubble.accent.add_modifier(Modifier::BOLD)
+                } else {
+                    bubble.muted
+                };
+                spans.push(Span::styled(check, check_style));
+
+                let label = format!("{:<14}", p.name);
+                let label_style = if is_focused {
+                    bubble
+                        .selected
+                        .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else if p.enabled {
+                    bubble.title
+                } else {
+                    bubble.muted
+                };
+                spans.push(Span::styled(label, label_style));
+                spans.push(bubble.span(" "));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(section_header(
+        "Credentials",
+        "pick a row, type the credential, then Ctrl-S — Claude & Codex use CLI login",
+        &bubble,
+    ));
+    for (i, kv) in KEY_VENDORS.iter().enumerate() {
+        let focused = state.focus == Focus::Key(i);
+        lines.push(key_row(kv, &state.keys[i], focused, &bubble));
+    }
+    lines.push(Line::from(""));
+
+    // — Save + status —
+    let save_idx = lines.len();
+    lines.push(save_line(state.focus == Focus::Save, &bubble));
+    if !state.status.is_empty() {
+        let ok = !state.status.starts_with("save failed");
+        let mark = if ok { "✓ " } else { "✗ " };
+        let style = if ok { bubble.accent } else { bubble.selected };
+        lines.push(Line::from(vec![
+            Span::styled(mark, style.add_modifier(Modifier::BOLD)),
+            Span::styled(state.status.clone(), bubble.muted),
+        ]));
+    }
+
+    let target_line = match state.focus {
+        Focus::Primary => 1,
+        Focus::ShowFullEmail => 3,
+        Focus::ShowExtraModels => 4,
+        Focus::NotifyResets => 5,
+        Focus::Display(row) => display_first + row.index(),
+        Focus::PanelAccount(i) => accounts_first + i,
+        Focus::Provider(i) => providers_first + (i % ROWS),
+        // The key rows start a fixed distance below the provider grid.
+        Focus::Key(i) => providers_first + 9 + i,
+        Focus::Save => save_idx,
+    };
+    let visible = chunks[0].height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let scroll = if visible >= lines.len() || target_line < 5 {
+        0
+    } else {
+        target_line.saturating_sub(visible / 2).min(max_scroll)
+    };
+
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), chunks[0]);
+
+    // Context-aware hint footer.
+    let hint = match state.focus {
+        Focus::Primary => bubble.help_line([
+            ("↑↓", "move"),
+            ("←→", "change vendor"),
+            ("tab", "next section"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::Display(_) => bubble.help_line([
+            ("↑↓", "move"),
+            ("←→", "change"),
+            ("tab", "next section"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::ShowFullEmail
+        | Focus::ShowExtraModels
+        | Focus::NotifyResets
+        | Focus::PanelAccount(_) => bubble.help_line([
+            ("↑↓", "move"),
+            ("space", "toggle"),
+            ("tab", "next section"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::Provider(_) => bubble.help_line([
+            ("↑↓←→", "select"),
+            ("space", "toggle"),
+            ("tab", "next section"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::Key(_) => bubble.help_line([
+            ("↑↓", "move"),
+            ("type", "edit key"),
+            ("^V", "reveal"),
+            ("tab", "next section"),
+            ("^S", "save"),
+            ("esc", "close"),
+        ]),
+        Focus::Save => bubble.help_line([
+            ("↑↓", "move"),
+            ("tab", "next section"),
+            ("enter/^S", "save"),
+            ("esc", "close"),
+        ]),
+    };
+    f.render_widget(Paragraph::new(hint), chunks[1]);
+}
+
+fn section_header(title: &str, sub: &str, theme: &BubbleTheme) -> Line<'static> {
+    Line::from(vec![
+        theme.span(" "),
+        Span::styled(title.to_string(), theme.title.add_modifier(Modifier::BOLD)),
+        theme.muted(format!("   — {sub}")),
+    ])
+}
+
+fn primary_line(state: &SettingsState, theme: &BubbleTheme) -> Line<'static> {
+    let focused = state.focus == Focus::Primary;
+    let name = state.primary.display_name().to_string();
+    if focused {
+        Line::from(vec![
+            theme.span("   "),
+            Span::styled("▸ ", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled("◀ ", theme.accent),
+            Span::styled(
+                format!(" {name} "),
+                theme
+                    .selected
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ),
+            Span::styled(" ▶", theme.accent),
+            theme.muted("    ← → to change"),
+        ])
+    } else {
+        Line::from(vec![theme.span("     "), Span::styled(name, theme.text)])
+    }
+}
+
+fn key_row(kv: &KeyVendor, input: &KeyInput, focused: bool, theme: &BubbleTheme) -> Line<'static> {
+    let label = format!("{:<11}", kv.label);
+    let value = value_text(input, focused);
+
+    // Env / status suffix: env-var name, whether an env override is set, note.
+    let env_name = kv.id.api_key_env();
+    let env_set = std::env::var(env_name)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let mut suffix = format!("   {env_name}");
+    if env_set {
+        suffix.push_str(" · env set (overrides)");
+    }
+    if !kv.note.is_empty() {
+        suffix.push_str(&format!(" · {}", kv.note));
+    }
+
+    if focused {
+        let val_style = if input.buf.is_empty() {
+            theme.accent.add_modifier(Modifier::BOLD)
+        } else {
+            theme.selected.add_modifier(Modifier::REVERSED)
+        };
+        let mut spans = vec![
+            theme.span("  "),
+            Span::styled("▸ ", theme.accent.add_modifier(Modifier::BOLD)),
+            Span::styled(label, theme.title.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {value} "), val_style),
+        ];
+        if input.revealed {
+            spans.push(theme.muted("  [revealed]"));
+        }
+        spans.push(theme.muted(suffix));
+        Line::from(spans)
+    } else {
+        let val_style = if input.buf.is_empty() {
+            theme.muted
+        } else {
+            theme.text
+        };
+        Line::from(vec![
+            theme.span("    "),
+            Span::styled(label, theme.text),
+            Span::styled(format!(" {value}"), val_style),
+            theme.muted(suffix),
+        ])
+    }
+}
+
+/// The value column: `(empty)` / a cursor when focused-empty / masked or
+/// revealed buffer with a cursor mark inserted when focused.
+fn value_text(input: &KeyInput, focused: bool) -> String {
+    if input.buf.is_empty() {
+        return if focused {
+            "‸".to_string()
+        } else {
+            "(empty)".to_string()
+        };
+    }
+    let base = input.display();
+    if !focused {
+        return base;
+    }
+    let mut chars: Vec<char> = base.chars().collect();
+    let pos = input.cursor.min(chars.len());
+    chars.insert(pos, '‸');
+    chars.into_iter().collect()
+}
+
+fn save_line(focused: bool, theme: &BubbleTheme) -> Line<'static> {
+    let style = if focused {
+        theme
+            .selected
+            .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        theme.accent.add_modifier(Modifier::BOLD)
+    };
+    let marker = if focused { "▸ " } else { "  " };
+    Line::from(vec![
+        theme.span("   "),
+        Span::styled(marker, theme.accent.add_modifier(Modifier::BOLD)),
+        Span::styled("  Save  (Ctrl-S)  ", style),
+    ])
+}
+
+/// Center a rectangle of `percent_x * percent_y` over `r`.
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_h = (r.height * percent_y) / 100;
+    let popup_w = (r.width * percent_x) / 100;
+    Rect {
+        x: r.x + (r.width - popup_w) / 2,
+        y: r.y + (r.height - popup_h) / 2,
+        width: popup_w,
+        height: popup_h,
+    }
+}
+
+// crossterm types live behind ratatui; re-exported here for handle_key callers.
+pub use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn temp_config(initial: Option<&str>) -> (TempDir, std::path::PathBuf) {
+        crate::cache::closed_temp_file("config.toml", initial)
+    }
+
+    fn key_index(id: VendorId) -> usize {
+        KEY_VENDORS.iter().position(|kv| kv.id == id).unwrap()
+    }
+
+    fn blank_state(primary: VendorId) -> SettingsState {
+        SettingsState {
+            focus: Focus::Primary,
+            primary_choices: VendorId::all().to_vec(),
+            primary,
+            providers: VendorId::all()
+                .iter()
+                .map(|id| ProviderToggle {
+                    id: *id,
+                    name: id.display_name(),
+                    enabled: *id == primary,
+                    dirty: false,
+                })
+                .collect(),
+            keys: KEY_VENDORS.iter().map(|_| KeyInput::default()).collect(),
+            show_full_email: Some(true),
+            show_extra_models: Some(false),
+            notify_resets: Some(true),
+            multi_account: None,
+            refresh_interval: None,
+            display: DisplayConfig::default().resolved(),
+            display_dirty: false,
+            panel_accounts: Vec::new(),
+            status: String::new(),
+        }
+    }
+
+    /// State with a Z.AI key and an OpenRouter key, both marked dirty.
+    fn state_with(zai: &str, opr: &str, primary: VendorId) -> SettingsState {
+        let mut s = blank_state(primary);
+        s.keys[key_index(VendorId::Zai)] = KeyInput::from_config(Some(zai));
+        s.keys[key_index(VendorId::Zai)].dirty = true;
+        s.keys[key_index(VendorId::Openrouter)] = KeyInput::from_config(Some(opr));
+        s.keys[key_index(VendorId::Openrouter)].dirty = true;
+        s
+    }
+
+    #[test]
+    fn focus_cycles_through_primary_all_keys_and_save() {
+        let num_providers = VendorId::all().len();
+        for accounts in [0usize, 2] {
+            let mut f = Focus::Primary;
+            let mut seen = vec![f];
+            // Primary + 3 toggles + display rows + account toggles + providers + keys + Save.
+            let cycle =
+                4 + DisplayRow::ALL.len() + accounts + num_providers + KEY_VENDORS.len() + 1;
+            for _ in 0..cycle {
+                f = f.next(accounts);
+                seen.push(f);
+            }
+            assert_eq!(seen.first(), Some(&Focus::Primary));
+            assert_eq!(
+                seen.last(),
+                Some(&Focus::Primary),
+                "one full cycle with {accounts} accounts"
+            );
+            for row in DisplayRow::ALL {
+                assert!(seen.contains(&Focus::Display(row)));
+            }
+            assert_eq!(seen.contains(&Focus::PanelAccount(1)), accounts == 2);
+            assert!(!seen.contains(&Focus::PanelAccount(accounts)));
+            assert!(seen.contains(&Focus::Provider(num_providers - 1)));
+            assert!(seen.contains(&Focus::Key(KEY_VENDORS.len() - 1)));
+            // prev() is the inverse of next() everywhere.
+            for f in &seen {
+                assert_eq!(f.next(accounts).prev(accounts), *f, "{f:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn display_rows_cycle_and_mark_the_section_dirty() {
+        let mut s = blank_state(VendorId::Anthropic);
+        assert!(!s.display_dirty);
+        handle_display(&mut s, DisplayRow::Mode, KeyCode::Char(' '));
+        assert_eq!(s.display.bar_mode(), BarMode::Carousel);
+        assert!(s.display_dirty);
+        s.display.bar_count = Some(6);
+        handle_display(&mut s, DisplayRow::Count, KeyCode::Right);
+        assert_eq!(
+            s.display.bar_count(),
+            1,
+            "count wraps so Space reaches every value"
+        );
+        handle_display(&mut s, DisplayRow::Count, KeyCode::Left);
+        assert_eq!(s.display.bar_count(), 6);
+        s.display.carousel_interval = Some(5);
+        handle_display(&mut s, DisplayRow::Interval, KeyCode::Right);
+        assert_eq!(s.display.carousel_interval(), 10);
+        handle_display(&mut s, DisplayRow::Interval, KeyCode::Left);
+        assert_eq!(s.display.carousel_interval(), 5);
+    }
+
+    #[test]
+    fn display_section_round_trips_through_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n[ui]\nprimary = \"anthropic\"\n").unwrap();
+        let mut s = blank_state(VendorId::Anthropic);
+        s.display.bar_mode = Some(BarMode::Carousel);
+        s.display.bar_unit = Some(BarUnit::Account);
+        s.display.hidden_accounts = Some(vec!["work".into()]);
+        s.display_dirty = true;
+        save_to_path(&s, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine"), "comments survive");
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.display.bar_mode(), BarMode::Carousel);
+        assert_eq!(cfg.display.bar_unit(), BarUnit::Account);
+        assert_eq!(cfg.display.hidden_accounts(), ["work".to_string()]);
+    }
+
+    #[test]
+    fn a_new_display_table_keeps_trailing_comments_with_their_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[commandcode]\nenabled = false\n# auth_paths = [\"x\"]\n",
+        )
+        .unwrap();
+        let mut s = blank_state(VendorId::Anthropic);
+        s.display_dirty = true;
+        save_to_path(&s, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let comment = text.find("# auth_paths").unwrap();
+        let header = text.find("[display]").unwrap();
+        assert!(
+            comment < header,
+            "the comment stays under [commandcode]:\n{text}"
+        );
+        Config::load_from(&path).unwrap();
+    }
+
+    #[test]
+    fn untouched_display_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[ui]\n").unwrap();
+        save_to_path(&blank_state(VendorId::Anthropic), &path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("[display]")
+        );
+    }
+
+    #[test]
+    fn native_display_patch_merges_and_rejects_bad_values() {
+        let cfg: Config =
+            toml::from_str("[display]\nbar_count = 4\nhover_mode = \"pager\"\n").unwrap();
+        let state = state_from_apply_request(
+            &cfg,
+            r#"{"schema_version":1,"display":{"bar_mode":"carousel","hidden_accounts":["a"]}}"#,
+        )
+        .unwrap();
+        assert!(state.display_dirty);
+        assert_eq!(state.display.bar_mode(), BarMode::Carousel);
+        assert_eq!(
+            state.display.bar_count(),
+            4,
+            "absent fields keep their saved value"
+        );
+        assert_eq!(state.display.hover_mode(), HoverMode::Pager);
+        assert_eq!(state.display.hidden_accounts(), ["a".to_string()]);
+        assert!(
+            state_from_apply_request(
+                &cfg,
+                r#"{"schema_version":1,"display":{"bar_mode":"sideways"}}"#,
+            )
+            .is_err()
+        );
+        let state = state_from_apply_request(
+            &cfg,
+            r#"{"schema_version":1,"multi_account":false,"show_full_email":false}"#,
+        )
+        .unwrap();
+        assert_eq!(state.multi_account, Some(false));
+        assert!(
+            state_from_apply_request(&cfg, r#"{"schema_version":1,"refresh_interval":1}"#).is_err()
+        );
+        assert_eq!(state.show_full_email, Some(false));
+        assert!(!state.display_dirty, "no display patch, no [display] write");
+    }
+
+    #[test]
+    fn every_key_vendor_has_a_field() {
+        // Every enabled-by-key vendor must be reachable in the form.
+        for id in [
+            VendorId::Zai,
+            VendorId::Openrouter,
+            VendorId::Deepseek,
+            VendorId::Kilo,
+            VendorId::Novita,
+            VendorId::Moonshot,
+            VendorId::Grok,
+        ] {
+            assert!(
+                KEY_VENDORS.iter().any(|kv| kv.id == id),
+                "{id:?} has no key field"
+            );
+        }
+        // OAuth vendors are intentionally absent.
+        assert!(!KEY_VENDORS.iter().any(|kv| kv.id == VendorId::Anthropic));
+        assert!(!KEY_VENDORS.iter().any(|kv| kv.id == VendorId::Openai));
+    }
+
+    #[test]
+    fn from_config_prefills_existing_keys() {
+        let mut cfg = Config::default();
+        cfg.kilo.api_key = Some("sk-kilo".into());
+        let s = SettingsState::from_config(&cfg);
+        assert_eq!(s.keys[key_index(VendorId::Kilo)].buf, "sk-kilo");
+        assert!(!s.keys[key_index(VendorId::Kilo)].dirty);
+    }
+
+    #[test]
+    fn copilot_has_no_editable_credential_field() {
+        assert!(
+            !KEY_VENDORS
+                .iter()
+                .any(|vendor| vendor.id == VendorId::Copilot)
+        );
+    }
+
+    /// The exported-env-var path is real behaviour and deserves a test of its
+    /// own — just not one that reads the machine it runs on.
+    #[test]
+    fn a_key_vendor_with_its_env_var_exported_is_offered() {
+        let cfg = Config::default();
+        let env = cfg.api_key_env_for(VendorId::Ollama).to_string();
+
+        let without = SettingsState::from_config_with(&cfg, |_| false);
+        assert!(!without.primary_choices.contains(&VendorId::Ollama));
+
+        let with = SettingsState::from_config_with(&cfg, |name| name == env);
+        assert!(
+            with.primary_choices.contains(&VendorId::Ollama),
+            "a key vendor whose env var is exported must be selectable: {:?}",
+            with.primary_choices
+        );
+    }
+
+    #[test]
+    fn from_config_offers_enabled_vendors_only() {
+        let cfg = Config::default();
+        // No ambient environment: this must not depend on whether the machine
+        // running `cargo test` happens to export OLLAMA_API_KEY or friends.
+        let s = SettingsState::from_config_with(&cfg, |_| false);
+        let mut expected = cfg.enabled_vendors();
+        expected.push(VendorId::Copilot);
+        assert_eq!(s.primary_choices, expected);
+        // API-key opt-in vendors are disabled by default and must not be
+        // offered. Copilot is the exception: choosing it enables it safely.
+        assert!(!s.primary_choices.contains(&VendorId::Grok));
+        assert!(s.primary_choices.contains(&s.primary));
+        assert!(s.primary_choices.contains(&VendorId::Copilot));
+    }
+
+    #[test]
+    fn from_config_falls_back_when_configured_primary_is_disabled() {
+        // Grok is opt-in; a config naming it as primary without enabling it
+        // must display the first enabled vendor instead.
+        let mut cfg = Config::default();
+        cfg.ui.primary = Some(VendorId::Grok);
+        let s = SettingsState::from_config(&cfg);
+        assert_ne!(s.primary, VendorId::Grok);
+        assert_eq!(Some(s.primary), cfg.enabled_vendors().first().copied());
+    }
+
+    #[test]
+    fn key_input_insert_backspace_arrow() {
+        let mut k = KeyInput::default();
+        k.insert_char('a');
+        k.insert_char('b');
+        k.insert_char('c');
+        assert_eq!(k.buf, "abc");
+        assert_eq!(k.cursor, 3);
+        assert!(k.dirty);
+        k.move_left();
+        k.move_left();
+        assert_eq!(k.cursor, 1);
+        k.insert_char('x');
+        assert_eq!(k.buf, "axbc");
+        assert_eq!(k.cursor, 2);
+        k.backspace();
+        assert_eq!(k.buf, "abc");
+        assert_eq!(k.cursor, 1);
+    }
+
+    #[test]
+    fn key_input_masks_by_default_reveals_on_toggle() {
+        let mut k = KeyInput::default();
+        for c in "secret-key".chars() {
+            k.insert_char(c);
+        }
+        assert_eq!(k.display(), "•".repeat(10));
+        k.toggle_reveal();
+        assert_eq!(k.display(), "secret-key");
+    }
+
+    #[test]
+    fn key_input_handles_unicode() {
+        let mut k = KeyInput::default();
+        k.insert_char('a');
+        k.insert_char('→');
+        k.insert_char('b');
+        assert_eq!(k.buf, "a→b");
+        assert_eq!(k.cursor, 3);
+        k.move_left();
+        k.backspace();
+        assert_eq!(k.buf, "ab");
+    }
+
+    #[test]
+    fn value_text_shows_cursor_and_empty_states() {
+        let mut k = KeyInput::default();
+        assert_eq!(value_text(&k, false), "(empty)");
+        assert_eq!(value_text(&k, true), "‸");
+        k.insert_char('a');
+        k.insert_char('b');
+        // masked + cursor at end
+        assert_eq!(value_text(&k, true), "••‸");
+        assert_eq!(value_text(&k, false), "••");
+    }
+
+    #[test]
+    fn save_writes_key_and_enables_vendor() {
+        let (_dir, path) = temp_config(None);
+        let mut s = blank_state(VendorId::Kilo);
+        s.keys[key_index(VendorId::Kilo)] = KeyInput::from_config(Some("sk-kilo"));
+        s.keys[key_index(VendorId::Kilo)].dirty = true;
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("primary = \"kilo\""));
+        assert!(raw.contains("[kilo]"));
+        assert!(raw.contains("api_key = \"sk-kilo\""));
+        assert!(raw.contains("enabled = true"));
+    }
+
+    #[test]
+    fn save_writes_minimal_toml_when_starting_empty() {
+        let (_dir, path) = temp_config(None);
+        let s = state_with("zk", "ok", VendorId::Zai);
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("primary = \"zai\""));
+        assert!(raw.contains("[zai]"));
+        assert!(raw.contains("api_key = \"zk\""));
+        assert!(raw.contains("[openrouter]"));
+        assert!(raw.contains("api_key = \"ok\""));
+    }
+
+    #[test]
+    fn save_preserves_existing_comments_and_unrelated_fields() {
+        let (_dir, path) = temp_config(Some(
+            r##"# my comment
+[ui]
+# pre-existing comment
+primary = "anthropic"
+
+[zai]
+enabled = true
+api_key_env = "ZAI_API_KEY"
+# tier comment
+plan_tier = "pro"
+
+[openrouter]
+enabled = true
+api_key_env = "OPENROUTER_API_KEY"
+
+[[openrouter.accounts]]
+label = "work"
+api_key_env = "OPENROUTER_WORK_API_KEY"
+"##,
+        ));
+
+        let s = state_with("zk2", "ok2", VendorId::Openrouter);
+        save_to_path(&s, &path).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# my comment"));
+        assert!(raw.contains("# pre-existing comment"));
+        assert!(raw.contains("# tier comment"));
+        assert!(raw.contains("api_key_env = \"ZAI_API_KEY\""));
+        assert!(raw.contains("[[openrouter.accounts]]"));
+        assert!(raw.contains("api_key_env = \"OPENROUTER_WORK_API_KEY\""));
+        assert!(raw.contains("plan_tier = \"pro\""));
+        assert!(raw.contains("primary = \"openrouter\""));
+        assert!(raw.contains("api_key = \"zk2\""));
+        assert!(raw.contains("api_key = \"ok2\""));
+    }
+
+    #[test]
+    fn test_provider_toggle_and_save() {
+        let (_dir, path) = temp_config(Some(
+            r#"
+[antigravity]
+enabled = false
+
+[deepseek]
+enabled = false
+"#,
+        ));
+        let mut state = blank_state(VendorId::Anthropic);
+        let agy_idx = state
+            .providers
+            .iter()
+            .position(|p| p.id == VendorId::Antigravity)
+            .unwrap();
+        state.focus = Focus::Provider(agy_idx);
+        handle_key(&mut state, KeyCode::Char(' '), KeyModifiers::empty());
+        assert!(state.providers[agy_idx].enabled);
+        assert!(state.providers[agy_idx].dirty);
+
+        save_to_path(&state, &path).unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(cfg.is_enabled(VendorId::Antigravity));
+    }
+
+    #[test]
+    fn save_refuses_to_replace_an_unreadable_existing_config() {
+        let (_dir, path) = temp_config(None);
+        let original = [0xff, 0xfe, 0xfd];
+        std::fs::write(&path, original).unwrap();
+        let state = state_with("new-secret", "", VendorId::Zai);
+
+        assert!(save_to_path(&state, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn save_does_not_write_empty_key_when_dirty_but_blank() {
+        let (_dir, path) = temp_config(None);
+        let mut s = blank_state(VendorId::Anthropic);
+        // Focus each key, do nothing but mark dirty (blank).
+        for k in &mut s.keys {
+            k.dirty = true;
+        }
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("api_key ="));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_chmods_to_600() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, path) = temp_config(None);
+        let s = state_with("zk", "ok", VendorId::Zai);
+        save_to_path(&s, &path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn tab_cycles_focus_through_sections() {
+        let mut s = blank_state(VendorId::Anthropic);
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Tab, KeyModifiers::NONE),
+            Action::Continue
+        );
+        assert_eq!(s.focus, Focus::ShowFullEmail);
+        let tab = |s: &mut SettingsState, code| {
+            assert_eq!(handle_key(s, code, KeyModifiers::NONE), Action::Continue);
+            s.focus
+        };
+        assert_eq!(tab(&mut s, KeyCode::Tab), Focus::Display(DisplayRow::Mode));
+        assert_eq!(tab(&mut s, KeyCode::Tab), Focus::Provider(0));
+        assert_eq!(tab(&mut s, KeyCode::Tab), Focus::Key(0));
+        assert_eq!(tab(&mut s, KeyCode::BackTab), Focus::Provider(0));
+        assert_eq!(
+            tab(&mut s, KeyCode::BackTab),
+            Focus::Display(DisplayRow::Mode)
+        );
+        assert_eq!(tab(&mut s, KeyCode::BackTab), Focus::ShowFullEmail);
+        assert_eq!(
+            handle_key(&mut s, KeyCode::BackTab, KeyModifiers::NONE),
+            Action::Continue
+        );
+        assert_eq!(s.focus, Focus::Primary);
+    }
+
+    #[test]
+    fn esc_closes_without_saving() {
+        let mut s = blank_state(VendorId::Anthropic);
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Esc, KeyModifiers::NONE),
+            Action::Close
+        );
+    }
+
+    #[test]
+    fn left_right_cycles_primary_vendor() {
+        // Canonical order (VendorId::all): Anthropic, AnthropicApi, Openai, …
+        let mut s = blank_state(VendorId::Anthropic);
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::AnthropicApi);
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::Openai);
+        handle_key(&mut s, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::AnthropicApi);
+    }
+
+    #[test]
+    fn left_right_offers_enabled_vendors_only() {
+        // The selector must never land on a vendor the widget cannot use.
+        let mut s = blank_state(VendorId::Anthropic);
+        s.primary_choices = vec![VendorId::Anthropic, VendorId::Grok];
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::Grok);
+        // Wraps within the enabled set rather than walking into disabled ones.
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::Anthropic);
+        handle_key(&mut s, KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::Grok);
+    }
+
+    #[test]
+    fn no_enabled_vendors_leaves_primary_selector_inert() {
+        let mut s = blank_state(VendorId::Anthropic);
+        s.primary_choices = vec![];
+        handle_key(&mut s, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::Anthropic);
+    }
+
+    #[test]
+    fn disabled_copilot_is_offered_but_not_shown_as_the_current_primary() {
+        let mut cfg = Config::default();
+        cfg.ui.primary = Some(VendorId::Copilot);
+        let state = SettingsState::from_config(&cfg);
+
+        assert!(state.primary_choices.contains(&VendorId::Copilot));
+        assert_eq!(state.primary, VendorId::Anthropic);
+    }
+
+    #[test]
+    fn save_does_not_write_a_disabled_primary() {
+        // Saving an API key must not persist a primary the resolver would
+        // ignore; an existing value in the file stays untouched.
+        let (_dir, path) = temp_config(Some("[ui]\nprimary = \"anthropic\"\n"));
+        let mut s = state_with("zk", "ok", VendorId::Grok);
+        s.primary_choices = vec![VendorId::Anthropic];
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("primary = \"anthropic\""));
+        assert!(!raw.contains("primary = \"grok\""));
+        // The keys still saved.
+        assert!(raw.contains("zk"));
+    }
+
+    #[test]
+    fn save_removes_an_inline_key_the_user_cleared() {
+        // Clearing the field in the overlay must delete the secret from the
+        // file — otherwise there is no way to remove it short of hand-editing.
+        let (_dir, path) = temp_config(Some(
+            "[zai]\nenabled = true\napi_key = \"old-secret\"\nplan_tier = \"pro\"\n",
+        ));
+        let mut s = blank_state(VendorId::Zai);
+        s.primary_choices = vec![VendorId::Zai];
+        s.keys[key_index(VendorId::Zai)] = KeyInput::default();
+        s.keys[key_index(VendorId::Zai)].dirty = true;
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("old-secret"));
+        assert!(!raw.contains("api_key"));
+        // Unrelated fields in the same section survive.
+        assert!(raw.contains("plan_tier = \"pro\""));
+    }
+
+    #[test]
+    fn untouched_key_field_is_left_alone() {
+        // Not dirty => the file's existing secret must survive a save.
+        let (_dir, path) = temp_config(Some("[zai]\napi_key = \"keep-me\"\n"));
+        let mut s = blank_state(VendorId::Zai);
+        s.primary_choices = vec![VendorId::Zai];
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("keep-me"));
+    }
+
+    #[test]
+    fn typing_edits_the_focused_key_only() {
+        let mut s = blank_state(VendorId::Anthropic);
+        s.focus = Focus::Key(key_index(VendorId::Grok));
+        for c in "xai-abc".chars() {
+            handle_key(&mut s, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(s.keys[key_index(VendorId::Grok)].buf, "xai-abc");
+        assert!(s.keys[key_index(VendorId::Grok)].dirty);
+        // No other field was touched.
+        assert!(s.keys[key_index(VendorId::Zai)].buf.is_empty());
+    }
+
+    #[test]
+    fn ctrl_v_toggles_reveal_on_focused_key_field() {
+        let mut s = blank_state(VendorId::Anthropic);
+        let zi = key_index(VendorId::Zai);
+        s.focus = Focus::Key(zi);
+        s.keys[zi] = KeyInput::from_config(Some("secret"));
+        assert!(!s.keys[zi].revealed);
+        handle_key(&mut s, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert!(s.keys[zi].revealed);
+        handle_key(&mut s, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert!(!s.keys[zi].revealed);
+    }
+
+    #[test]
+    fn control_chorded_chars_do_not_type_into_fields() {
+        let mut s = blank_state(VendorId::Anthropic);
+        s.focus = Focus::Key(0);
+        // Ctrl-A must NOT insert a literal 'a' or mark the field dirty.
+        handle_key(&mut s, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(s.keys[0].buf.is_empty());
+        assert!(!s.keys[0].dirty);
+        // Ctrl-C quits the host TUI even while the overlay owns focus.
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Action::Quit
+        );
+        // A plain char still types normally.
+        handle_key(&mut s, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(s.keys[0].buf, "x");
+    }
+
+    #[test]
+    fn ctrl_v_on_non_key_focus_is_noop() {
+        let mut s = blank_state(VendorId::Anthropic);
+        s.focus = Focus::Primary;
+        // Must not panic when no key field is focused.
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Char('v'), KeyModifiers::CONTROL),
+            Action::Continue
+        );
+    }
+
+    fn state_focused_on_zai() -> SettingsState {
+        let mut state = blank_state(VendorId::Anthropic);
+        state.focus = Focus::Key(key_index(VendorId::Zai));
+        state
+    }
+
+    #[test]
+    fn handle_key_ctrl_c_quits_without_typing_into_key_field() {
+        let mut s = state_focused_on_zai();
+        let zi = key_index(VendorId::Zai);
+        assert_eq!(
+            handle_key(&mut s, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Action::Quit
+        );
+        assert!(s.keys[zi].buf.is_empty());
+        // Untouched means save still leaves an existing key on disk alone.
+        assert!(!s.keys[zi].dirty);
+    }
+
+    #[test]
+    fn handle_key_alt_chord_does_not_type_into_key_field() {
+        let mut s = state_focused_on_zai();
+        let zi = key_index(VendorId::Zai);
+        handle_key(&mut s, KeyCode::Char('x'), KeyModifiers::ALT);
+        assert!(s.keys[zi].buf.is_empty());
+        assert!(!s.keys[zi].dirty);
+    }
+
+    #[test]
+    fn handle_key_platform_modifier_chords_do_not_type_into_key_field() {
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::HYPER, KeyModifiers::META] {
+            let mut s = state_focused_on_zai();
+            let zi = key_index(VendorId::Zai);
+            handle_key(&mut s, KeyCode::Char('x'), modifier);
+            assert!(s.keys[zi].buf.is_empty(), "modifier {modifier:?}");
+            assert!(!s.keys[zi].dirty, "modifier {modifier:?}");
+        }
+    }
+
+    #[test]
+    fn handle_key_shift_still_types_uppercase() {
+        let mut s = state_focused_on_zai();
+        let zi = key_index(VendorId::Zai);
+        handle_key(&mut s, KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(s.keys[zi].buf, "A");
+        assert!(s.keys[zi].dirty);
+    }
+
+    #[test]
+    fn handle_key_plain_space_still_cycles_primary_vendor() {
+        let mut s = blank_state(VendorId::Anthropic);
+        handle_key(&mut s, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(s.primary, VendorId::AnthropicApi);
+    }
+
+    #[test]
+    fn handle_key_ctrl_s_attempts_save_from_any_field() {
+        let (_dir, path) = temp_config(None);
+        let s = state_with("zk", "ok", VendorId::Zai);
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("api_key = \"zk\""));
+    }
+    #[test]
+    fn save_to_path_writes_kimi_key_when_dirty() {
+        let (_dir, path) = temp_config(None);
+        let mut s = blank_state(VendorId::Anthropic);
+        let kimi = key_index(VendorId::Kimi);
+        s.keys[kimi] = KeyInput::from_config(Some("kk"));
+        s.keys[kimi].dirty = true;
+        save_to_path(&s, &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[kimi]"));
+        assert!(raw.contains("api_key = \"kk\""));
+    }
+
+    #[test]
+    fn settings_save_uses_the_same_config_path_as_load() {
+        assert_eq!(
+            default_config_path().unwrap(),
+            crate::config::resolved_path().unwrap()
+        );
+    }
+
+    #[test]
+    fn native_snapshot_reports_key_state_without_serializing_secrets() {
+        let mut cfg = Config::default();
+        cfg.zai.api_key = Some("never-leak-this-key".into());
+        cfg.zai.api_key_env = "CUSTOM_ZAI_KEY".into();
+        let raw = settings_snapshot_json_with(&cfg, |name| name == "CUSTOM_ZAI_KEY").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["primary"], "anthropic");
+        let zai = parsed["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "zai")
+            .unwrap();
+        assert_eq!(zai["configured"], true);
+        assert_eq!(zai["inline_configured"], true);
+        assert_eq!(zai["environment_configured"], true);
+        assert_eq!(zai["environment"], "CUSTOM_ZAI_KEY");
+        assert!(!raw.contains("never-leak-this-key"));
+        assert!(parsed.get("api_key").is_none());
+    }
+
+    #[test]
+    fn native_snapshot_offers_copilot_primary_without_a_token_field() {
+        let cfg = Config::default();
+        let raw = settings_snapshot_json_with(&cfg, |_| false).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            parsed["primary_choices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "copilot")
+        );
+        assert!(
+            !parsed["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == "copilot")
+        );
+    }
+
+    #[test]
+    fn native_key_only_patch_does_not_require_or_replace_primary() {
+        let cfg = Config::default();
+        let original_primary = SettingsState::from_config(&cfg).primary;
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "keys": {"kimi": {"action": "set", "value": "new-kimi-key"}}
+        });
+
+        let state = state_from_apply_request(&cfg, &request.to_string()).unwrap();
+        assert_eq!(state.primary, original_primary);
+        let kimi_index = KEY_VENDORS
+            .iter()
+            .position(|vendor| vendor.id == VendorId::Kimi)
+            .unwrap();
+        assert!(state.keys[kimi_index].dirty);
+        assert_eq!(state.keys[kimi_index].buf, "new-kimi-key");
+    }
+
+    #[test]
+    fn native_patch_reuses_tui_persistence_and_preserves_existing_config() {
+        let (_dir, path) = temp_config(Some(
+            r#"# keep this comment
+[ui]
+primary = "anthropic"
+
+[zai]
+enabled = true
+api_key_env = "ZAI_API_KEY"
+plan_tier = "pro"
+
+[openrouter]
+enabled = true
+"#,
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "primary": "openrouter",
+            "keys": {
+                "zai": {"action": "set", "value": "new-zai-key"}
+            }
+        });
+
+        apply_settings_json_to_path(&cfg, &request.to_string(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep this comment"));
+        assert!(raw.contains("plan_tier = \"pro\""));
+        assert!(raw.contains("api_key_env = \"ZAI_API_KEY\""));
+        assert!(raw.contains("primary = \"openrouter\""));
+        assert!(raw.contains("api_key = \"new-zai-key\""));
+    }
+
+    #[test]
+    fn native_patch_distinguishes_clear_from_unchanged() {
+        let (_dir, path) = temp_config(Some(
+            "[zai]\nenabled = true\napi_key = \"remove-me\"\n\
+             [openrouter]\nenabled = true\napi_key = \"keep-me\"\n",
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let request = serde_json::json!({
+            "schema_version": 1,
+            "primary": "zai",
+            "keys": {"zai": {"action": "clear"}}
+        });
+
+        apply_settings_json_to_path(&cfg, &request.to_string(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("remove-me"));
+        assert!(raw.contains("keep-me"));
+    }
+
+    #[test]
+    fn native_primary_selection_enables_copilot_without_writing_a_token() {
+        let (_dir, path) = temp_config(Some(
+            "[copilot]\nenabled = false\ntoken = \"legacy-value\"\ntoken_env = \"OLD_TOKEN\"\n",
+        ));
+        let cfg = Config::load_from(&path).unwrap();
+        let select = serde_json::json!({
+            "schema_version": 1,
+            "primary": "copilot"
+        });
+        apply_settings_json_to_path(&cfg, &select.to_string(), &path).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("enabled = true"));
+        assert!(raw.contains("primary = \"copilot\""));
+        assert!(!raw.contains("token ="));
+        assert!(!raw.contains("token_env ="));
+    }
+
+    #[test]
+    fn native_patch_errors_never_echo_key_values() {
+        let raw = serde_json::json!({
+            "schema_version": 1,
+            "primary": "anthropic",
+            "keys": {
+                "zai": {"action": "set", "value": "secret\nwith-control"}
+            }
+        })
+        .to_string();
+        let error = state_from_apply_request(&Config::default(), &raw)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("secret"));
+        assert!(error.contains("control characters"));
+    }
+
+    #[test]
+    fn native_patch_input_is_bounded_before_json_parsing() {
+        let oversized = vec![b'x'; MAX_SETTINGS_REQUEST_BYTES as usize + 1];
+        let error = read_settings_request(std::io::Cursor::new(oversized))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeds"));
+    }
+}

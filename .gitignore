@@ -1,0 +1,39 @@
+/target
+**/*.rs.bk
+
+# Sandbox marker, not part of the project.
+.ai-jail
+
+# Claude Code local scratch state.
+.claude/
+
+# Local secrets — never commit
+.env
+.env.local
+*.credentials.json
+
+# Per-vendor config scratch files (config.<vendor>.toml) — never commit.
+# Only config.example.toml and the user's own config.toml are tracked.
+config.*.toml
+!config.example.toml
+
+# Snapshot review files from `cargo insta`
+*.snap.new
+
+# makepkg build outputs (kept out of the source repo)
+packaging/aur/pkg/
+packaging/aur/src/
+packaging/aur/*.pkg.tar.*
+packaging/aur/*.tar.gz
+
+# GNOME extension - compiled schema (build artifact)
+frontends/gnome/schemas/gschemas.compiled
+
+# Compiled macOS menu bar app (built by frontends/macos/build.sh)
+frontends/macos/ai-monitor-menubar
+
+# Local screenshots for PR bodies (not tracked; drag into the PR on GitHub)
+frontends/macos/printscreen/
+
+frontends/windows/popover/node_modules/
+frontends/windows/popover/dist/
